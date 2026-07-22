@@ -1,7 +1,9 @@
-from pyatmos import download_sw_jb2008, read_sw_jb2008, jb2008
 import matplotlib.pyplot as plt
 import numpy as np
 from datetime import datetime, timedelta
+from ssl_bootstrap import configure_ssl_certificates
+configure_ssl_certificates()
+from pyatmos import download_sw_jb2008, read_sw_jb2008, jb2008
 
 print("\n" + "="*80)
 print("КОЛЕБАНИЯ ПЛОТНОСТИ АТМОСФЕРЫ ОТ ВРЕМЕНИ (МОДЕЛЬ JB2008)")
@@ -10,6 +12,7 @@ print("="*80)
 # Загружаем данные космической погоды
 print("\nЗагрузка данных космической активности...")
 try:
+    configure_ssl_certificates()
     swfile = download_sw_jb2008() 
     swdata = read_sw_jb2008(swfile)
     if swdata is None or len(swdata) == 0:

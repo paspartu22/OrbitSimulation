@@ -1,3 +1,13 @@
+import warnings
+from ssl_bootstrap import configure_ssl_certificates
+
+warnings.filterwarnings(
+    "ignore",
+    message="pkg_resources is deprecated as an API.*",
+    category=UserWarning,
+)
+
+configure_ssl_certificates()
 from pyatmos import download_sw_jb2008,read_sw_jb2008
 # Download or update the space weather file from https://sol.spacenvironment.net
 swfile = download_sw_jb2008() 
