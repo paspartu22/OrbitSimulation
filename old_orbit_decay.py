@@ -12,11 +12,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.integrate import odeint
-from datetime import datetime
-from ssl_bootstrap import configure_ssl_certificates
-
-
-configure_ssl_certificates()
+from datetime import datetime, timedelta
 from pyatmos import download_sw_jb2008, read_sw_jb2008, jb2008
 
 
@@ -26,17 +22,9 @@ class OrbitDecayCalculator:
     # Константы
     EARTH_RADIUS = 6371.0  # км
     GM_EARTH = 3.986004418e5  # км³/с² (гравитационный параметр Земли)
-    REENTRY_ALTITUDE = 110.0  # км
-    G0 = 9.80665  # м/с²
-
-    # Характеристики ДУ
-    THRUST_N = 6e-3
-    TOTAL_IMPULSE_NS = 220.0
-    PROPELLANT_MASS_KG = 0.13
     
-    def __init__(self, mass: float = 2.0, cd: float = 2.2, area: float = 0.00503, lat: float = 0.0, lon: float = 0.0,
-                 start_date: str = '2020-01-01 00:00:00',
-                 atmosphere_time: str = '2020-01-01 00:00:00'):
+    def __init__(self, mass: float = 2.0, cd: float = 2.2, area: float = 0.00503,
+                 lat: float = 0.0, lon: float = 0.0, start_date: str = '2026-01-01 00:00:00'):
         """
         Инициализация калькулятора деградации орбиты с JB2008
         
@@ -47,7 +35,6 @@ class OrbitDecayCalculator:
             lat: Широта орбиты в градусах
             lon: Долгота орбиты в градусах
             start_date: Начальная дата в формате 'YYYY-MM-DD HH:MM:SS'
-            atmosphere_time: Фиксированное время атмосферы для статического расчета
         """
         self.mass = mass
         self.cd = cd
@@ -56,18 +43,10 @@ class OrbitDecayCalculator:
         self.lon = lon
         self.start_date_str = start_date
         self.start_date = datetime.strptime(start_date, '%Y-%m-%d %H:%M:%S')
-        self.atmosphere_time_str = atmosphere_time
-        self.atmosphere_time = datetime.strptime(atmosphere_time, '%Y-%m-%d %H:%M:%S')
-
-        self.mass_current = mass
-        self.impulse_used_ns = 0.0
-        self.propellant_used_kg = 0.0
-        self.isp_s = self.TOTAL_IMPULSE_NS / (self.PROPELLANT_MASS_KG * self.G0)
         
         # Загружаем данные космической погоды
         print("Загрузка данных космической активности для JB2008...")
         try:
-            configure_ssl_certificates()
             swfile = download_sw_jb2008()
             self.swdata = read_sw_jb2008(swfile)
             print("✓ Данные космической активности загружены")
@@ -82,22 +61,20 @@ class OrbitDecayCalculator:
         
         Args:
             h: Высота в км
-            t_days: Не используется в статическом режиме
+            t_days: Время в днях от начальной даты (для симуляции деградации)
             
         Returns:
             Плотность в кг/м³
         """
-        # odeint может передавать высоту как ndarray([h]); JB2008 ожидает скаляр.
-        h_scalar = float(np.atleast_1d(h)[0])
-
-        # Статическая атмосфера: используем фиксированный момент времени.
-        time_str = self.atmosphere_time.strftime('%Y-%m-%d %H:%M:%S')
+        # Расчитываем текущую дату
+        current_date = self.start_date + timedelta(days=t_days)
+        time_str = current_date.strftime('%Y-%m-%d %H:%M:%S')
         
         try:
-            jb08_result = jb2008(time_str, (self.lat, self.lon, h_scalar), self.swdata)
+            jb08_result = jb2008(time_str, (self.lat, self.lon, h), self.swdata)
             return jb08_result.rho
         except Exception as e:
-            print(f"Ошибка JB2008 на {time_str}, высота {h_scalar}км: {type(e).__name__}")
+            print(f"Ошибка JB2008 на {time_str}, высота {h}км: {type(e).__name__}")
             # Возвращаем минимальное значение плотности в случае ошибки
             return 1e-15
     
@@ -126,58 +103,6 @@ class OrbitDecayCalculator:
         """
         r = self.EARTH_RADIUS + h
         return 2 * np.pi * np.sqrt(r**3 / self.GM_EARTH)
-
-    def apogee_velocity(self, rp_km: float, ra_km: float) -> float:
-        """Скорость в апогее эллиптической орбиты (км/с)."""
-        rp_r = self.EARTH_RADIUS + rp_km
-        ra_r = self.EARTH_RADIUS + ra_km
-        a = 0.5 * (rp_r + ra_r)
-        return np.sqrt(self.GM_EARTH * (2.0 / ra_r - 1.0 / a))
-
-    def perigee_from_apogee_state(self, ra_km: float, v_apogee_km_s: float) -> float:
-        """Перигей (км) после импульса, заданного в апогее."""
-        ra_r = self.EARTH_RADIUS + ra_km
-        a_new = 1.0 / (2.0 / ra_r - (v_apogee_km_s ** 2) / self.GM_EARTH)
-        rp_r = 2.0 * a_new - ra_r
-        return rp_r - self.EARTH_RADIUS
-
-    def delta_v_to_restore_perigee(self, rp_km: float, ra_km: float, rp_target_km: float) -> float:
-        """Требуемый Δv в апогее для подъема перигея до rp_target (км/с)."""
-        rp_target = min(rp_target_km, ra_km)
-        if rp_km >= rp_target:
-            return 0.0
-
-        v_now = self.apogee_velocity(rp_km, ra_km)
-        v_target = self.apogee_velocity(rp_target, ra_km)
-        return max(0.0, v_target - v_now)
-
-    def apply_apogee_burn(self, rp_km: float, ra_km: float, dv_km_s: float) -> tuple:
-        """Применить импульс в апогее с учетом ограничений ДУ."""
-        if dv_km_s <= 0.0:
-            return rp_km, 0.0, 0.0, 0.0, 0.0
-
-        impulse_left = self.TOTAL_IMPULSE_NS - self.impulse_used_ns
-        if impulse_left <= 0.0 or self.mass_current <= 0.0:
-            return rp_km, 0.0, 0.0, 0.0, 0.0
-
-        dv_max_m_s = impulse_left / self.mass_current
-        dv_apply_m_s = min(dv_km_s * 1000.0, dv_max_m_s)
-        dv_apply_km_s = dv_apply_m_s / 1000.0
-
-        impulse_used = self.mass_current * dv_apply_m_s
-        burn_time_s = impulse_used / self.THRUST_N
-        prop_used = self.PROPELLANT_MASS_KG * (impulse_used / self.TOTAL_IMPULSE_NS)
-
-        self.impulse_used_ns += impulse_used
-        self.propellant_used_kg += prop_used
-        self.mass_current = max(self.mass - self.propellant_used_kg, self.mass - self.PROPELLANT_MASS_KG)
-
-        v_old = self.apogee_velocity(rp_km, ra_km)
-        v_new = v_old + dv_apply_km_s
-        rp_new = self.perigee_from_apogee_state(ra_km, v_new)
-        rp_new = min(max(rp_new, 0.0), ra_km)
-
-        return rp_new, dv_apply_km_s, burn_time_s, impulse_used, prop_used
     
     def drag_force(self, h: float, t_days: float = 0) -> float:
         """
@@ -242,6 +167,8 @@ class OrbitDecayCalculator:
         dh_dt_per_day = dh_dt * 86400  # км/день
         
         return dh_dt_per_day
+        
+        return dh_dt_per_day
     
     def decay_rate_detailed(self, h: float, t_days: float = 0) -> dict:
         """
@@ -260,8 +187,6 @@ class OrbitDecayCalculator:
         F = self.drag_force(h, t_days)
         dh_dt = self.decay_rate(h, t_days)
         
-        time_linear = max(0.0, h - self.REENTRY_ALTITUDE) / (-dh_dt) if dh_dt < 0 else np.inf
-
         return {
             'altitude_km': h,
             'density_kg_m3': rho,
@@ -271,133 +196,13 @@ class OrbitDecayCalculator:
             'drag_force_N': F,
             'deceleration_m_s2': self.deceleration(h, t_days),
             'decay_rate_km_day': dh_dt,
-            # Линейная оценка (по локальному dh/dt на начальной высоте).
-            'time_to_reentry_days_linear': time_linear,
-            # Для обратной совместимости.
-            'time_to_reentry_days': time_linear,
+            'time_to_reentry_days': h / (-dh_dt) if dh_dt < 0 else np.inf
         }
-
-    def estimate_reentry_time_integrated(self, h_initial: float, max_days: float,
-                                         num_steps: int = 2000) -> float:
-        """Оценить время до REENTRY_ALTITUDE по интегрированной траектории."""
-        t, h = self.integrate_decay(h_initial, days=max_days, num_steps=num_steps)
-        if len(h) > 0 and h[-1] <= self.REENTRY_ALTITUDE + 1e-6:
-            return float(t[-1])
-        return np.inf
-
-    def simulate_station_keeping(self, h_initial: float, days: float = 3650.0,
-                                 step_days: float = 1.0) -> dict:
-        """Удержание орбиты непрерывной компенсацией аэродинамического сопротивления."""
-        self.mass_current = self.mass
-        self.impulse_used_ns = 0.0
-        self.propellant_used_kg = 0.0
-
-        t_days = [0.0]
-        h_hist = [h_initial]
-        drag_force_hist = [self.drag_force(h_initial)]
-        counter_force_hist = [0.0]
-        impulse_left_hist = [self.TOTAL_IMPULSE_NS]
-        propellant_used_hist = [0.0]
-        mass_hist = [self.mass_current]
-
-        dt = step_days
-        dt_s = dt * 86400.0
-        steps = int(np.ceil(days / dt))
-
-        for step in range(1, steps + 1):
-            t = step * dt
-            h = h_hist[-1]
-
-            if h <= self.REENTRY_ALTITUDE:
-                break
-
-            drag_force = self.drag_force(h)
-            decay_uncomp = self.decay_rate(h)  # км/день, отрицательное значение
-
-            impulse_left = max(0.0, self.TOTAL_IMPULSE_NS - self.impulse_used_ns)
-            max_counter_by_impulse = impulse_left / dt_s if dt_s > 0.0 else 0.0
-            counter_force = min(drag_force, self.THRUST_N, max_counter_by_impulse)
-
-            # Скорость деградации линейна по силе сопротивления: масштабируем dh/dt
-            if drag_force > 0.0:
-                net_decay = decay_uncomp * max(0.0, (drag_force - counter_force) / drag_force)
-            else:
-                net_decay = 0.0
-
-            h_next = max(0.0, h + net_decay * dt)
-
-            impulse_used = counter_force * dt_s
-            prop_used = self.PROPELLANT_MASS_KG * (impulse_used / self.TOTAL_IMPULSE_NS)
-
-            self.impulse_used_ns += impulse_used
-            self.propellant_used_kg += prop_used
-            self.mass_current = max(self.mass - self.propellant_used_kg, self.mass - self.PROPELLANT_MASS_KG)
-
-            t_days.append(t)
-            h_hist.append(h_next)
-            drag_force_hist.append(drag_force)
-            counter_force_hist.append(counter_force)
-            impulse_left_hist.append(max(0.0, self.TOTAL_IMPULSE_NS - self.impulse_used_ns))
-            propellant_used_hist.append(self.propellant_used_kg)
-            mass_hist.append(self.mass_current)
-
-            if h_next <= self.REENTRY_ALTITUDE:
-                break
-
-        return {
-            't_days': np.array(t_days),
-            'h_km': np.array(h_hist),
-            'drag_force_N': np.array(drag_force_hist),
-            'counter_force_N': np.array(counter_force_hist),
-            'impulse_left_ns': np.array(impulse_left_hist),
-            'propellant_used_kg_hist': np.array(propellant_used_hist),
-            'mass_kg_hist': np.array(mass_hist),
-            'mass_final_kg': self.mass_current,
-            'impulse_used_ns': self.impulse_used_ns,
-            'propellant_used_kg': self.propellant_used_kg,
-        }
-
-    def plot_station_keeping(self, result: dict, figsize: tuple = (14, 8)):
-        """Графики station-keeping с непрерывной компенсацией сопротивления."""
-        t = result['t_days']
-        h = result['h_km']
-        drag_f = result['drag_force_N']
-        counter_f = result['counter_force_N']
-        impulse_left = result['impulse_left_ns']
-
-        fig, axes = plt.subplots(2, 1, figsize=figsize, sharex=True)
-
-        ax = axes[0]
-        ax.plot(t, h, label='Высота орбиты, км', color='tab:blue', linewidth=2.0)
-        ax.axhline(self.REENTRY_ALTITUDE, color='tab:red', linestyle='--',
-                   label=f'Порог входа ({self.REENTRY_ALTITUDE:.0f} км)')
-        ax.set_ylabel('Высота, км')
-        ax.set_title('Удержание орбиты: непрерывная компенсация сопротивления')
-        ax.grid(True, alpha=0.3)
-        ax.legend(loc='best')
-
-        ax = axes[1]
-        ax.plot(t, drag_f, color='tab:orange', linewidth=2.0, label='Сила сопротивления, Н')
-        ax.plot(t, counter_f, color='tab:green', linewidth=2.0, label='Компенсирующая тяга, Н')
-        ax2 = ax.twinx()
-        ax2.plot(t, impulse_left, color='tab:purple', linewidth=1.8, label='Остаток импульса, Н·с')
-
-        ax.set_xlabel('Время, дни')
-        ax.set_ylabel('Сила, Н')
-        ax2.set_ylabel('Остаток импульса, Н·с')
-        ax.grid(True, alpha=0.3)
-
-        lines_1, labels_1 = ax.get_legend_handles_labels()
-        lines_2, labels_2 = ax2.get_legend_handles_labels()
-        ax.legend(lines_1 + lines_2, labels_1 + labels_2, loc='best')
-
-        plt.tight_layout()
-        return fig, axes
     
     def integrate_decay(self, h_initial: float, days: float = 100,
                        num_steps: int = 1000) -> tuple:
         """
-        Интегрировать уравнение деградации орбиты до высоты REENTRY_ALTITUDE
+        Интегрировать уравнение деградации орбиты до высоты 100 км
         Используется JB2008 модель с учетом времени
         
         Args:
@@ -406,22 +211,25 @@ class OrbitDecayCalculator:
             num_steps: Количество шагов
             
         Returns:
-            Кортеж (время в днях, высота в км). Симуляция заканчивается на h=REENTRY_ALTITUDE
+            Кортеж (время в днях, высота в км). Симуляция заканчивается на h=100 км
         """
         error_count = [0]  # Счетчик ошибок
         
         def dh_dt_func(h, t):
-            h_scalar = float(np.atleast_1d(h)[0])
-            if h_scalar <= self.REENTRY_ALTITUDE:  # Спутник достиг границы входа
+            if h <= 100:  # Спутник достиг границы атмосферы
                 return 0
+            # Ограничиваем минимальное время до входа (для численной стабильности)
             try:
-                rate = self.decay_rate(h_scalar, t)
+                rate = self.decay_rate(h, t)
             except Exception as e:
                 error_count[0] += 1
                 if error_count[0] <= 5:
-                    print(f"  Ошибка при h={h_scalar:.1f}, t={t:.1f}: {type(e).__name__}: {e}")
+                    print(f"  Ошибка при h={h:.1f}, t={t:.1f}: {type(e).__name__}: {e}")
                 return 0
-
+                
+            if h > 100 and rate < 0 and (h - 100) / (-rate) < 0.001:
+                # Если остаток времени очень мал, возвращаем ноль
+                return 0
             return rate
         
         t_array = np.linspace(0, days, num_steps)
@@ -436,20 +244,16 @@ class OrbitDecayCalculator:
         if error_count[0] > 0:
             print(f"  Всего ошибок в ODE: {error_count[0]}")
         
-        # Находим индекс, где высота впервые достигает или опускается ниже REENTRY_ALTITUDE.
-        # Если пересечение не попало точно в сетку, принудительно завершаем
-        # траекторию на REENTRY_ALTITUDE, когда остаемся в узкой окрестности порога.
-        idx_100 = np.where(h_array <= self.REENTRY_ALTITUDE)[0]
+        # Находим индекс, где высота впервые достигает или опускается ниже 100 км
+        idx_100 = np.where(h_array <= 100)[0]
         if len(idx_100) > 0:
-            # Берем все значения до первого пересечения порога высоты.
+            # Берем все значения до первого пересечения h=100
             idx = idx_100[0]
             t_array = t_array[:idx+1]
             h_array = h_array[:idx+1]
-            # Убедимся, что последняя точка ровно на пороге высоты входа.
-            if idx < len(h_array) - 1 or h_array[-1] < self.REENTRY_ALTITUDE:
-                h_array[-1] = self.REENTRY_ALTITUDE
-        elif h_array[-1] <= self.REENTRY_ALTITUDE + 0.05:
-            h_array[-1] = self.REENTRY_ALTITUDE
+            # Убедимся, что последняя точка ровно на 100 км
+            if idx < len(h_array) - 1 or h_array[-1] < 100:
+                h_array[-1] = 100.0
         
         return t_array, h_array
     
@@ -462,10 +266,6 @@ class OrbitDecayCalculator:
             figsize: Размер фигуры
         """
         details = self.decay_rate_detailed(altitude)
-        linear_days = details['time_to_reentry_days_linear']
-        integration_window = min(max(linear_days * 3, 365.0), 10000.0) if np.isfinite(linear_days) else 1000.0
-        integrated_days = self.estimate_reentry_time_integrated(altitude, max_days=integration_window)
-        display_days = integrated_days if np.isfinite(integrated_days) else linear_days
         
         fig, axes = plt.subplots(1, 3, figsize=figsize)
         fig.suptitle(f'Анализ деградации орбиты на высоте {altitude} км\n'
@@ -492,23 +292,21 @@ class OrbitDecayCalculator:
         Замедление: a = {details['deceleration_m_s2']:.3e} м/с²
         
         Скорость понижения: dh/dt = {details['decay_rate_km_day']:.3f} км/день
-        Время до высоты {self.REENTRY_ALTITUDE:.0f} км (интегр.): {display_days:.1f} дней
-        Линейная оценка: {linear_days:.1f} дней
+        Время до входа в атмосферу: {details['time_to_reentry_days']:.1f} дней
         """
         ax.text(0.05, 0.5, info_text, fontsize=10, family='monospace',
                 verticalalignment='center', 
                 bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
         
         # Рассчитываем деградацию (используется для всех графиков)
-        days_to_reentry = display_days if np.isfinite(display_days) else 1000
+        days_to_reentry = min(details['time_to_reentry_days'], 1000)
         t, h = self.integrate_decay(altitude, days=days_to_reentry, num_steps=500)
         
         # 2. Эволюция орбиты во времени
         ax = axes[1]
         ax.plot(t, h, 'b-', linewidth=2.5, label='Высота орбиты')
-        ax.axhline(y=self.REENTRY_ALTITUDE, color='r', linestyle='--', linewidth=2,
-               label=f'Граница входа ({self.REENTRY_ALTITUDE:.0f} км)')
-        ax.fill_between(t, 0, self.REENTRY_ALTITUDE, alpha=0.2, color='red', label='Зона входа в атмосферу')
+        ax.axhline(y=100, color='r', linestyle='--', linewidth=2, label='Граница атмосферы (100 км)')
+        ax.fill_between(t, 0, 100, alpha=0.2, color='red', label='Зона входа в атмосферу')
         ax.set_xlabel('Время (дни)', fontsize=11)
         ax.set_ylabel('Высота орбиты (км)', fontsize=11)
         ax.set_title('Эволюция орбиты', fontsize=12, fontweight='bold')
@@ -543,13 +341,9 @@ class OrbitDecayCalculator:
         print(f"\nПАРАМЕТРЫ ОРБИТЫ:")
         print(f"  Широта: {self.lat}°, Долгота: {self.lon}°")
         print(f"  Начальная дата: {self.start_date_str}")
-        print(f"  Фиксированное время атмосферы: {self.atmosphere_time_str}")
         
         print(f"\nПАРАМЕТРЫ НА ВЫСОТЕ {altitude} км (начальный момент времени):")
         details = self.decay_rate_detailed(altitude, t_days=0)
-        linear_days = details['time_to_reentry_days_linear']
-        integration_window = min(max(linear_days * 3, 365.0), 10000.0) if np.isfinite(linear_days) else 1000.0
-        integrated_days = self.estimate_reentry_time_integrated(altitude, max_days=integration_window)
         
         print(f"\n  Атмосферные:")
         print(f"    Плотность: ρ = {details['density_kg_m3']:.3e} кг/м³")
@@ -564,13 +358,8 @@ class OrbitDecayCalculator:
         
         print(f"\n  РЕЗУЛЬТАТЫ:")
         print(f"    Скорость понижения орбиты: dh/dt = {details['decay_rate_km_day']:.6f} км/день")
-        if np.isfinite(integrated_days):
-            print(f"    Время до высоты {self.REENTRY_ALTITUDE:.0f} км (интегр.): {integrated_days:.2f} дней")
-            print(f"                                             ({integrated_days/365.25:.3f} лет)")
-        else:
-            print(f"    Время до высоты {self.REENTRY_ALTITUDE:.0f} км (интегр.): не достигнуто")
-        print(f"    Линейная оценка (локальная): {linear_days:.2f} дней")
-        print(f"                                 ({linear_days/365.25:.3f} лет)")
+        print(f"    Время до входа в атмосферу: {details['time_to_reentry_days']:.2f} дней")
+        print(f"                                 ({details['time_to_reentry_days']/365.25:.3f} лет)")
 
 
 def main():
@@ -584,13 +373,11 @@ def main():
     # Параметры орбиты и времени
     lat = 0.0  # широта в градусах
     lon = 0.0  # долгота в градусах
-    start_date = '2020-01-01 00:00:00'  # начальная дата
-    atmosphere_time = '2020-01-01 00:00:00'  # статическое состояние атмосферы
+    start_date = '2026-01-01 00:00:00'  # начальная дата
     
     # Создаем калькулятор
     calc = OrbitDecayCalculator(mass=mass, cd=cd, area=area, 
-                                lat=lat, lon=lon, start_date=start_date,
-                                atmosphere_time=atmosphere_time)
+                                lat=lat, lon=lon, start_date=start_date)
     
     # Анализ на высоте 280 км
     altitude = 280.0
@@ -606,29 +393,6 @@ def main():
     fig, _ = calc.plot_decay_analysis(altitude=altitude)
     plt.savefig('orbit_decay_analysis_280km.png', dpi=150, bbox_inches='tight')
     print("✓ График сохранен: orbit_decay_analysis_280km.png")
-
-    print("\n" + "=" * 80)
-    print("РЕЖИМ УДЕРЖАНИЯ ОРБИТЫ (НЕПРЕРЫВНАЯ КОМПЕНСАЦИЯ СОПРОТИВЛЕНИЯ)")
-    print("=" * 80)
-
-    keep = calc.simulate_station_keeping(altitude, days=3650, step_days=1.0)
-    fig_keep, _ = calc.plot_station_keeping(keep)
-    plt.savefig('orbit_station_keeping_280km.png', dpi=150, bbox_inches='tight')
-    print("✓ График сохранен: orbit_station_keeping_280km.png")
-
-    last_day = float(keep['t_days'][-1]) if len(keep['t_days']) > 0 else 0.0
-    h_last = float(keep['h_km'][-1]) if len(keep['h_km']) > 0 else 0.0
-    impulse_left = max(0.0, calc.TOTAL_IMPULSE_NS - keep['impulse_used_ns'])
-    mean_drag = float(np.mean(keep['drag_force_N'])) if len(keep['drag_force_N']) > 0 else 0.0
-    mean_counter = float(np.mean(keep['counter_force_N'])) if len(keep['counter_force_N']) > 0 else 0.0
-
-    print(f"  Длительность моделирования: {last_day:.1f} дней")
-    print(f"  Финальная высота: {h_last:.2f} км")
-    print(f"  Средняя сила сопротивления: {mean_drag:.3e} Н")
-    print(f"  Средняя компенсирующая тяга: {mean_counter:.3e} Н")
-    print(f"  Израсходовано импульса: {keep['impulse_used_ns']:.2f} Н·с")
-    print(f"  Остаток импульса: {impulse_left:.2f} Н·с")
-    print(f"  Израсходовано рабочего тела: {keep['propellant_used_kg']:.4f} кг")
     
     # Анализ для разных космических погод
     print("\n" + "=" * 80)
